@@ -1,9 +1,9 @@
 /*
- * S5L8747 MBX Lite: register/command completion draft, not a renderer.
+ * S5L8747 MBX Lite register/command bridge to the software renderer model.
  * Reference: docs/research/gpu-mbx.md (gpu-mbx-spec.md was unavailable).
  * Register-pair jobs are applied by firmware, not fetched by +0x6ec.
- * Completion is synchronous; FIFO words are consumed immediately, hence
- * +0x12c occupancy is always zero (0x7b words free).
+ * FIFO words are consumed immediately (+0x12c occupancy always zero),
+ * while completion events are scheduled on emulated timers. Not hardware.
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
@@ -121,9 +121,12 @@ static void mbx_summary(void)
     Nano7MbxState *s = mbx_singleton;
 
     if (s && s->scenes) {
+        MbxrStats stats;
+        mbxr_get_stats(s->r, &stats);
         fprintf(stderr, "[nano7-mbx] summary: %" PRIu64 " scenes, %" PRIu64
-                " renders done, %" PRIu64 " render jobs (nothing drawn)\n",
-                s->scenes, s->renders, s->jobs);
+                " renders done, %" PRIu64 " render jobs; model frames %" PRIu64
+                " frags %" PRIu64 "\n", s->scenes, s->renders, s->jobs,
+                stats.frames, stats.frags);
     }
 }
 
@@ -256,8 +259,22 @@ static void mbx_write(void *opaque, hwaddr off, uint64_t value,
          * size, stride) via 0x083f1a88, then +0x6ec. Completion = bits 2|3
          * and 6 together (0x08148c48 frees the render slot, sets ctx+0x30) */
         s->core[n] = v;
-        mbxr_render(s->r, s->core);
-        nano7_timer_mod(s->job_timer, nano7_now_ns() + mbx_job_ns(s));
+        /* NanoOS's hardware-tested ISP pair list first clears +0x6ec,
+         * before setting the target. That zero is not a render launch. */
+        if (v) {
+            mbxr_render(s->r, s->core);
+            nano7_timer_mod(s->job_timer, nano7_now_ns() + mbx_job_ns(s));
+        }
+        break;
+    case 0x680:
+        /* Final ISP launch in the physical-device-validated NanoOS path.
+         * Rendering previously happened prematurely at its +0x6ec=0 write,
+         * using target 0, while this actual kick was silently ignored. */
+        s->core[n] = v & ~1u;
+        if (v & 1) {
+            mbxr_render(s->r, s->core);
+            nano7_timer_mod(s->job_timer, nano7_now_ns() + mbx_job_ns(s));
+        }
         break;
     case 0x800:
         /* TA start (scene begin, 0x0812c394) */

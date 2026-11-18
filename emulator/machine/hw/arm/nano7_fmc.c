@@ -120,6 +120,11 @@ typedef struct NandStore {
     int64_t slot;               /* -1: page not in the store */
     int sect, last_sect;
     unsigned chunk;             /* +0x34 writes in this sector */
+    bool erase_armed;
+    bool erase_status;
+    bool power2[2], power_pending, power_data;
+    uint32_t power_ce;
+    uint32_t erase_row, erase_ce;
     NandRead rdq[FMC_NUM_CE][NAND_RDQ];
     unsigned rdq_head[FMC_NUM_CE], rdq_n[FMC_NUM_CE];
     int miss_policy;            /* NAND_MISS_* */
@@ -258,6 +263,14 @@ static void fmc_fill_params(uint8_t *p)
     fmc_put32(p + 0xec, 0x200);     /* 4..0x2000 */
     fmc_put32(p + 0xf0, 10);        /* 1..50 */
     fmc_put32(p + 0xf4, 10);        /* 1..50 */
+    /* Opt-in geometry of the physical N31 used by native storage tests.
+     * Keep the older broad bring-up profile as the default. */
+    if (getenv("NANO7_FMC_N31_PARAMS")) {
+        fmc_put32(p + 0x10, 2);
+        fmc_put32(p + 0x14, 1);
+        fmc_put32(p + 0x18, 2088);
+        fmc_put32(p + 0x34, 16448);
+    }
     fmc_put32(p + 0xf8, 100);       /* 1..200 */
     fmc_put32(p + 0xfc, 100);       /* 1..200 */
 }
@@ -532,6 +545,50 @@ static bool nand_dma(Nano7FmcState *s, uint32_t dram)
 
 static void fmc_do_cmd(Nano7FmcState *s, uint8_t cmd)
 {
+    NandStore *n = &s->nand;
+
+    if (cmd == 0xff && s->ce >= 0 && s->ce < FMC_NUM_CE) {
+        n->power2[s->ce] = false;
+        n->power_pending = false;
+    }
+    if (cmd == 0xef) {
+        n->power_pending = n->power_data = false;
+    }
+    if (cmd == 0xe7 && n->power_pending && n->power_data &&
+        n->power_ce == s->ce) {
+        n->power2[s->ce] = true;
+        n->power_pending = false;
+    }
+
+    if (cmd == 0xd7 && n->erase_armed && n->erase_ce == s->ce) {
+        uint8_t blank[NAND_REC];
+        NandHdr header;
+
+        nand_end(s);
+        n->erase_status = true;
+        memset(blank, 0xff, sizeof(blank));
+        memset(&header, 0xff, sizeof(header));
+        for (unsigned page = 0; page < 128 && !getenv("NANO7_FMC_NO_ERASE"); page++) {
+            uint32_t row = (n->erase_row & ~127u) | page;
+            int64_t slot = nand_lookup(n, n->erase_ce, row);
+
+            if (slot >= 0) {
+                header.magic = NAND_MAGIC;
+                header.ce = n->erase_ce;
+                header.addr = row;
+                header.valid = 0;
+                memcpy(blank, &header, sizeof(header));
+                if (pwrite(n->fd, blank, sizeof(blank), slot * NAND_REC) != sizeof(blank)) {
+                    fmc_log(s, "NAND erase store write failed: %s", strerror(errno));
+                }
+            }
+        }
+    }
+    if (cmd == 0xff || cmd == 0x6a || cmd == 0x79 || cmd == 0x0a ||
+        cmd == 0x07 || cmd == 0x8a || cmd == 0x87) {
+        n->erase_status = false;
+    }
+    n->erase_armed = false;
     s->last_cmd = cmd;
     if (!s->in_vm) {
         fmc_log(s, "CMD 0x%02x ce=%d", cmd, s->ce);
@@ -569,10 +626,19 @@ static void fmc_do_addr(Nano7FmcState *s)
     for (i = 0; i < n; i++) {
         a[i] = s->regs[(0x0c + (i & ~3u)) / 4] >> (8 * (i & 3));
     }
+    if (present && n == 2 && s->last_cmd == 0xef &&
+        s->regs[0x0c / 4] == 0x180) {
+        s->nand.power_pending = true;
+        s->nand.power_ce = s->ce;
+    }
     if (!s->in_vm) fmc_log(s, "ADDR n=%u %02x %02x %02x %02x %02x (cmd 0x%02x ce=%d)",
             n, a[0], n > 1 ? a[1] : 0, n > 2 ? a[2] : 0, n > 3 ? a[3] : 0,
             n > 4 ? a[4] : 0, s->cur_cmd, s->ce);
-    if (present && n == 4 && (s->last_cmd == 0x8a || s->last_cmd == 0x87)) {
+    if (present && n == 4 && s->last_cmd == 0x6a) {
+        s->nand.erase_armed = true;
+        s->nand.erase_ce = s->ce;
+        s->nand.erase_row = s->regs[0x0c / 4];
+    } else if (present && n == 4 && (s->last_cmd == 0x8a || s->last_cmd == 0x87)) {
         nand_prog_begin(s, s->regs[0x0c / 4]);
     } else if (present && n == 8 &&
                (s->last_cmd == 0x07 || s->last_cmd == 0x0a)) {
@@ -642,10 +708,26 @@ static uint64_t fmc_read(void *opaque, hwaddr offset, unsigned size)
         /* bit0/bit1 are strobes the sequencer polls for completion */
         v = (s->written[idx] ? s->regs[idx] : 0) & ~3u;
         break;
+    case 0x04:
+        v = s->written[idx] ? s->regs[idx] : 0xffffffffu;
+        if (v == 0x800) {
+            v |= 0x40000000u; /* controller-reset request reaches idle */
+        }
+        break;
     case 0x4c:
         /* PPN status byte: 0x62 after 0x79 (op status: ready, array
          * ready, bit1 pass), else 0x40 (ready, no error) */
         v = s->last_cmd == 0x79 ? 0x62 : 0x40;
+        /* Opt-in configuration lifetime: RESET drops power-state2; ID and
+         * params still work but an array read cannot finish its79 handshake. */
+        if (getenv("NANO7_FMC_REQUIRE_POWER2") && s->ce >= 0 &&
+            s->ce < FMC_NUM_CE && !s->nand.power2[s->ce]) {
+            v = 0x40;
+        }
+        /* Opt-in run48 erase-view bit4; never injected into read/program. */
+        if (s->nand.erase_status && getenv("NANO7_FMC_ERASE_STATUS50")) {
+            v |= 0x10;
+        }
         break;
     case 0x60: case 0x64: case 0x68: case 0x6c:
         v = s->written[idx] ? s->regs[idx] : 0;   /* ECC results: clean */
@@ -693,6 +775,12 @@ static void fmc_write(void *opaque, hwaddr offset, uint64_t value,
                 (unsigned)(offset & ~3), v);
     }
     switch (offset & ~3) {
+    case 0x80:
+        if (s->nand.power_pending && s->ce == s->nand.power_ce &&
+            (v & 255u) == 2) {
+            s->nand.power_data = true;
+        }
+        break;
     case 0x00:
         if (v == 1) {
             s->ce = -1;
@@ -740,6 +828,11 @@ static void fmc_write(void *opaque, hwaddr offset, uint64_t value,
             }
         }
         s->status |= FMC_DONE_BITS;
+        if (getenv("NANO7_FMC_FAIL_POWER_EVENT_CE") &&
+            s->ce == atoi(getenv("NANO7_FMC_FAIL_POWER_EVENT_CE")) &&
+            s->last_cmd == 0xef && v == 0x100e4) {
+            s->status &= ~8u;
+        }
         break;
     case 0x08:
         /* the command is issued on this write (the shutdown-path reset
@@ -767,11 +860,22 @@ static void fmc_write(void *opaque, hwaddr offset, uint64_t value,
         s->written[idx] = true;
         fmss_update_irq(s);
         return;
+    case 0xc60:
+        s->regs[0xc64 / 4] = v ? 1 : 0;
+        s->written[0xc64 / 4] = true;
+        break;
     case FMSS_KICK:
         s->regs[idx] = v;
         s->written[idx] = true;
-        if (v) {
+        if (v == 0xfff5) {
             fmss_run(s);
+        } else if (v == 8 || v == 2 || v == 0x80000) {
+            /* Stop/reset controls are NOT sequencer launches. Replaying
+             * stale C04/ring here programmed NAND during nand_probe(). */
+            s->regs[0xc08 / 4] = 0;
+            s->written[0xc08 / 4] = true;
+            s->cs_status = 0;
+            fmss_update_irq(s);
         }
         return;
     }
