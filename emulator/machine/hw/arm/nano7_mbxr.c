@@ -281,6 +281,7 @@ struct MbxR {
     uint32_t stage_valid;       /* stages uploaded since reset / resume */
     uint32_t prog[VGP_PROG_MAX][2]; /* vertex program memory (Session 56) */
     FILE *vpdump;               /* NANO7_MBXR_VPDUMP: per-draw VGP ground truth */
+    uint32_t vpdump_frame;      /* NANO7_MBXR_VPDUMP_FRAME (default VPDUMP_FRAME) */
     bool vgp_hle;               /* NANO7_MBXR_VGP=hle: Sessions 32-54 HLE */
     bool vgp_check;             /* NANO7_MBXR_VGPCHECK: interpreter vs HLE */
     float chk[5];               /* max |diff| p, colour, uv, uv1, fog */
@@ -358,6 +359,7 @@ MbxR *mbxr_new(void)
                  !strcmp(getenv("NANO7_MBXR_VGP"), "hle");
     if (getenv("NANO7_MBXR_VPDUMP")) {
         r->vpdump = fopen(getenv("NANO7_MBXR_VPDUMP"), "w");
+        r->vpdump_frame = getenv("NANO7_MBXR_VPDUMP_FRAME") ? (uint32_t)atoi(getenv("NANO7_MBXR_VPDUMP_FRAME")) : VPDUMP_FRAME;
     }
     if (getenv("NANO7_MBXR_DUMP")) {
         r->dump_isp = strtoul(getenv("NANO7_MBXR_DUMP"), NULL, 16);
@@ -973,7 +975,18 @@ static void vgp_run(MbxR *r, uint32_t ctl, const float in[8][4],
                     } else if (f == 2) {
                         v = t[idx];
                     } else {
-                        v = zero;
+                        /* Operand file 3 is NOT zero on hardware: OpenLara rooms
+                         * folded to MOV temp <- file 3 rendered brighter on the
+                         * device (2026-11-18). Modelled as NANO7_MBXR_FILE3
+                         * (default 1.0) so such code shows up in the emulator. */
+                        static float file3[4]; static int file3_init;
+                        if (!file3_init) {
+                            const char *e = getenv("NANO7_MBXR_FILE3");
+                            float f3 = e ? (float)atof(e) : 1.0f;
+                            file3[0] = file3[1] = file3[2] = file3[3] = f3;
+                            file3_init = 1;
+                        }
+                        v = file3; (void)zero;
                     }
                     for (i = 0; i < 4; i++) {
                         s[k][i] = v[(swz >> (2 * i)) & 3];
@@ -1298,7 +1311,7 @@ static void draw(MbxR *r, uint32_t prim, uint32_t ctl, const uint32_t *v,
             tex_matrix(r, 1, &o->u1, &o->v1);
         }
     }
-    if (r->vpdump && vgp && r->frames == VPDUMP_FRAME) {
+    if (r->vpdump && vgp && r->frames == r->vpdump_frame) {
         vp_dump(r, prim, ctl, v, stride, MIN(n, 8u), vx);
     }
     /* run the uploaded program per vertex - unless a stage it needs has not
